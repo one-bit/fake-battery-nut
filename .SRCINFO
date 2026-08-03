@@ -9,7 +9,6 @@ pkgbase = fake-battery-nut-dkms
 	makedepends = linux-headers
 	depends = dkms
 	depends = nut
-	depends = bc
 	source = fake-battery-nut-dkms-1.2.0.tar.gz::https://github.com/aaronsb/fake-battery-nut/archive/v1.2.0.tar.gz
 	sha256sums = 30545667d6f1de043d907fe3db533f04b14f50960fba6048d0c194ade4fdf747
 
