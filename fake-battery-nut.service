@@ -6,6 +6,10 @@ Wants=nut-server.service
 [Service]
 Type=simple
 Environment=NUT_UPS=cyberpower@localhost
+# Capacity reported while the UPS asserts LB/FSD. Keep it above UPower's
+# PercentageAction threshold: upsmon is the authority on shutdown, and
+# CriticalPowerAction should stay a backstop rather than fire on every LB.
+Environment=NUT_LB_CAPACITY=5
 ExecStart=/usr/bin/nut-to-fakebattery
 Restart=on-failure
 RestartSec=5
