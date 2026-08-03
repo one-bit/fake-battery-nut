@@ -946,4 +946,4 @@ module_exit(fake_battery_nut_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("NUT UPS to Linux power_supply bridge");
 MODULE_AUTHOR("Based on linux-fake-battery-module by Rob Hoelz");
-MODULE_VERSION("1.4.0");
+MODULE_VERSION("1.3.0");
