@@ -12,7 +12,10 @@
  * if the whole write validated.  A rejected write leaves the published state
  * completely unchanged.
  *
- *   capacity=N    - Battery capacity, 0-100 percent - maps to UPS battery charge
+ *   capacity=N    - Battery capacity, 0-100 percent - maps to UPS battery
+ *                   charge, or -1 = unknown.  An unknown capacity also reports
+ *                   the battery as not present and its level as UNKNOWN, so
+ *                   that missing data is never mistaken for a flat battery.
  *   status=N      - Set status (0=discharging, 1=charging, 2=full)
  *   charging=N    - Set AC online status (0=offline, 1=online)
  *   level=N       - Capacity level override, 0-5:
@@ -189,6 +192,16 @@ control_device_read(struct file *file, char *buffer, size_t count, loff_t *ppos)
 static int
 capacity_to_level(int capacity)
 {
+    /*
+     * An unknown charge must not fall through the thresholds below - the
+     * lowest of them is CRITICAL, so treating "no reading" as a number would
+     * report a flat battery on missing data, which is exactly the direction
+     * that gets a machine powered off.
+     */
+    if(capacity == VALUE_UNKNOWN) {
+        return POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
+    }
+
     if(capacity >= 98) {
         return POWER_SUPPLY_CAPACITY_LEVEL_FULL;
     } else if(capacity >= 70) {
@@ -272,7 +285,7 @@ handle_control_line(char *line, int *ac_status, struct battery_status *battery)
     }
 
     if(!strcmp(key, "capacity")) {
-        if(value < 0 || value > 100) {
+        if(value != VALUE_UNKNOWN && (value < 0 || value > 100)) {
             return -ERANGE;
         }
         battery->capacity = value;
@@ -469,7 +482,16 @@ fake_battery_get_property(struct power_supply *psy,
             val->intval = POWER_SUPPLY_HEALTH_GOOD;
             break;
         case POWER_SUPPLY_PROP_PRESENT:
-            val->intval = 1;
+            /*
+             * With no charge reading there is nothing to bridge, so report the
+             * battery as absent rather than as a battery of unknown charge.
+             * Userspace that cannot read a percentage tends to fall back to
+             * deriving one, and with no CHARGE_* or energy properties to derive
+             * from it can settle on 0% - indistinguishable from a flat battery,
+             * and enough to trigger a critical-power action. Absent is both
+             * honest and the safe direction to be wrong in.
+             */
+            val->intval = status.capacity != VALUE_UNKNOWN;
             break;
         case POWER_SUPPLY_PROP_TECHNOLOGY:
             val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
@@ -479,6 +501,9 @@ fake_battery_get_property(struct power_supply *psy,
                     status.capacity_level_override : status.capacity_level;
             break;
         case POWER_SUPPLY_PROP_CAPACITY:
+            if(status.capacity == VALUE_UNKNOWN) {
+                return -ENODATA;
+            }
             val->intval = status.capacity;
             break;
         case POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:

@@ -85,7 +85,7 @@ parse_nut() {
             else if (key == "ups.status")          status  = val
         }
         END {
-            cap = ""
+            cap = "-1"
             if (isnum(charge)) {
                 c = charge + 0
                 if (c < 0)   c = 0
@@ -177,7 +177,7 @@ while true; do
         sleep "$POLL_INTERVAL"
         continue
     fi
-    CAPACITY="${FIELDS[0]}"
+    CAPACITY="${FIELDS[0]:--1}"
     RUNTIME="${FIELDS[1]:--1}"
     VOLTAGE_UV="${FIELDS[2]:--1}"
     TEMP_TENTHS="${FIELDS[3]:--1}"
@@ -224,7 +224,12 @@ while true; do
     LEVEL=0
     if [ "$LOW_BATTERY" -eq 1 ]; then
         LEVEL=1
-        if [ -z "$CAPACITY" ] || [ "$CAPACITY" -gt "$LB_CAPACITY" ]; then
+        # The clamp also applies when the charge is unknown (-1): LB is a
+        # statement from the UPS that it is about to run out, which is worth
+        # reporting even with no percentage behind it. Without this the -1
+        # would survive, the battery would report itself absent, and the one
+        # moment the desktop most needs to react would go unannounced.
+        if [ "$CAPACITY" -lt 0 ] || [ "$CAPACITY" -gt "$LB_CAPACITY" ]; then
             CAPACITY="$LB_CAPACITY"
         fi
     fi
@@ -232,7 +237,7 @@ while true; do
     # Build the whole batch first and write it with one printf, so the module
     # sees a single all-or-nothing write.
     PAYLOAD=""
-    [ -n "$CAPACITY" ] && PAYLOAD+="capacity=$CAPACITY"$'\n'
+    PAYLOAD+="capacity=$CAPACITY"$'\n'
     PAYLOAD+="time=$RUNTIME"$'\n'
     PAYLOAD+="voltage=$VOLTAGE_UV"$'\n'
     PAYLOAD+="temp=$TEMP_TENTHS"$'\n'

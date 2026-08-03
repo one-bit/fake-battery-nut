@@ -131,7 +131,7 @@ than NUT, deciding when the machine goes down.
 Write `key=value` lines to `/dev/fake_battery_nut`. Every line must end with a newline:
 
 ```bash
-echo "capacity=100" | sudo tee /dev/fake_battery_nut     # Battery capacity, 0-100 %
+echo "capacity=100" | sudo tee /dev/fake_battery_nut     # Battery capacity, 0-100 %, or -1
 echo "status=2" | sudo tee /dev/fake_battery_nut         # 0=discharging, 1=charging, 2=full
 echo "charging=1" | sudo tee /dev/fake_battery_nut       # AC online, 0 or 1
 echo "level=0" | sudo tee /dev/fake_battery_nut          # Capacity level override, see below
@@ -156,13 +156,27 @@ tracking capacity underneath, so clearing the override takes effect immediately.
 so the daemon can state outright that the UPS said `LB`, instead of hoping the reported
 percentage happens to have fallen far enough for anyone to notice.
 
-**`-1` means "unknown"** for `time`, `voltage` and `temp`. The module returns `-ENODATA` for
-that property, so the sysfs attribute errors out and UPower omits the value rather than being
-handed a fabricated one. All three start out unknown at load - nothing is known until the
-daemon says so. A UPS that never publishes `battery.runtime` therefore produces no
-`time_to_empty_avg` at all, instead of a stately, permanent, entirely invented "1 hour remaining".
+**`-1` means "unknown"** for `capacity`, `time`, `voltage` and `temp`. The module returns
+`-ENODATA` for that property, so the sysfs attribute errors out and UPower omits the value
+rather than being handed a fabricated one. They all start out unknown at load - nothing is
+known until the daemon says so. A UPS that never publishes `battery.runtime` therefore produces
+no `time_to_empty_avg` at all, instead of a stately, permanent, entirely invented "1 hour
+remaining".
 
-**Values are range-checked and a write is transactional.** `capacity` 0-100, `status` 0-2,
+`capacity=-1` carries two extra consequences, both deliberate. The capacity level becomes
+`Unknown` rather than falling through the thresholds to `Critical` - the lowest band would
+otherwise turn "no reading" into "flat battery". And the battery reports itself **not present**,
+because a reader that cannot get a percentage tends to derive one, and with no `CHARGE_*` or
+energy properties left to derive from it can settle on 0% - which is indistinguishable from a
+genuinely empty battery and quite enough to trigger a critical-power action. An absent battery
+is the safe direction to be wrong in. The practical effect is that the desktop battery
+indicator disappears while the charge is unknown, rather than showing an alarming lie.
+
+Note the daemon still clamps to `NUT_LB_CAPACITY` when the UPS asserts `LB`, even with no
+percentage available: `LB` is the UPS stating it is about to run out, and that is worth
+reporting on its own.
+
+**Values are range-checked and a write is transactional.** `capacity` 0-100 or -1, `status` 0-2,
 `charging` 0-1, `level` 0-5, `temp` -400 to 1500 tenths of °C, `time` and `voltage` -1 or any
 non-negative value. Out of range is `-ERANGE`; an unknown key, or a line without an `=`, is
 `-EINVAL`. Keys are matched exactly, so `capacity_level=3` is an error rather than a silent
@@ -174,7 +188,7 @@ exactly as it was.
 
 | NUT Field | Control Command | power_supply Property |
 |-----------|-----------------|----------------------|
-| battery.charge | capacity | BAT0/capacity |
+| battery.charge | capacity | BAT0/capacity, BAT0/present |
 | battery.runtime | time | BAT0/time_to_empty_avg, BAT0/time_to_full_now |
 | battery.voltage | voltage | BAT0/voltage_now |
 | battery.temperature (or ups.temperature) | temp | BAT0/temp |
