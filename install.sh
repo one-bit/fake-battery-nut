@@ -29,19 +29,32 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Check dependencies
+# Test for the commands and the kernel build tree themselves, not for a
+# particular distro's package name - the module builds fine anywhere DKMS and
+# kernel headers exist. Package names appear only as hints in the errors.
 echo "Checking dependencies..."
 if ! command -v upsc &> /dev/null; then
-    echo "ERROR: NUT not installed. Install with: pacman -S nut"
+    echo "ERROR: NUT client not found ('upsc' is not in PATH)."
+    echo "       Arch:   pacman -S nut"
+    echo "       Fedora: dnf install nut"
+    echo "       Debian: apt install nut-client"
     exit 1
 fi
 
 if ! command -v dkms &> /dev/null; then
-    echo "ERROR: DKMS not installed. Install with: pacman -S dkms"
+    echo "ERROR: DKMS not found ('dkms' is not in PATH)."
+    echo "       Arch:   pacman -S dkms"
+    echo "       Fedora: dnf install dkms"
+    echo "       Debian: apt install dkms"
     exit 1
 fi
 
-if ! pacman -Q linux-headers &> /dev/null; then
-    echo "ERROR: linux-headers not installed. Install with: pacman -S linux-headers"
+KERNEL_BUILD="/lib/modules/$(uname -r)/build"
+if [ ! -d "$KERNEL_BUILD" ]; then
+    echo "ERROR: kernel headers for $(uname -r) not found at ${KERNEL_BUILD}"
+    echo "       Arch:   pacman -S linux-headers"
+    echo "       Fedora: dnf install kernel-devel-$(uname -r)"
+    echo "       Debian: apt install linux-headers-$(uname -r)"
     exit 1
 fi
 
