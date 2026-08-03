@@ -184,11 +184,56 @@ non-negative value. Out of range is `-ERANGE`; an unknown key, or a line without
 every line validated - one bad line rejects the entire write and leaves the published state
 exactly as it was.
 
+## UPS telemetry beyond the battery
+
+A UPS publishes a great deal that is not battery state - line voltage, load, frequency, shutdown
+timers, the beeper. None of it belongs in the power_supply class, and inventing a second power
+supply to carry it is exactly the mistake ADR-001 records: UPower averaged the old `BAT1` load
+meter into its `DisplayDevice` and reported a 100% UPS as a 34% battery.
+
+So it is published read-only under `/sys/class/misc/fake_battery_nut/` instead, where scripts and
+monitors can read it and nothing that walks the power_supply class ever sees it:
+
+```
+$ grep . /sys/class/misc/fake_battery_nut/{load,input_voltage,ups_type}
+/sys/class/misc/fake_battery_nut/load:46 %
+/sys/class/misc/fake_battery_nut/input_voltage:239200 mV
+/sys/class/misc/fake_battery_nut/ups_type:offline / line interactive
+```
+
+| Attribute | NUT variable | Unit |
+|-----------|--------------|------|
+| `load` | ups.load | percent |
+| `input_voltage` | input.voltage | mV |
+| `output_voltage` | output.voltage | mV |
+| `input_frequency` | input.frequency | mHz |
+| `input_voltage_nominal` | input.voltage.nominal | mV |
+| `input_frequency_nominal` | input.frequency.nominal | mHz |
+| `input_current_nominal` | input.current.nominal | mA |
+| `battery_voltage_nominal` | battery.voltage.nominal | mV |
+| `delay_shutdown` | ups.delay.shutdown | seconds |
+| `delay_start` | ups.delay.start | seconds |
+| `beeper` | ups.beeper.status | 0 disabled, 1 enabled, 2 muted |
+| `ups_type` | ups.type | string |
+| `status_raw` | ups.status | string, verbatim |
+| `manufacturer` | device.mfr | string |
+| `model` | device.model, or driver.parameter.product | string |
+
+Everything is scaled to integers - millivolts, millihertz, milliamperes - so no floating point is
+needed anywhere in the kernel. A value the UPS does not publish reads `unknown` rather than `0`,
+which would be indistinguishable from a real measurement.
+
 ## Data Mapping
 
 | NUT Field | Control Command | power_supply Property |
 |-----------|-----------------|----------------------|
 | battery.charge | capacity | BAT0/capacity, BAT0/present |
+| battery.voltage.high | voltage_max_design | BAT0/voltage_max_design |
+| battery.voltage.low | voltage_min_design | BAT0/voltage_min_design |
+| device.mfr | mfr | BAT0/manufacturer |
+| device.model (or driver.parameter.product) | model | BAT0/model_name |
+| device.serial | serial | BAT0/serial_number |
+| ups.status `RB` | health | BAT0/health |
 | battery.runtime | time | BAT0/time_to_empty_avg |
 | battery.voltage | voltage | BAT0/voltage_now |
 | battery.temperature (or ups.temperature) | temp | BAT0/temp |

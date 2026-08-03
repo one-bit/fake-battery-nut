@@ -65,6 +65,74 @@
 #define TEMP_MIN (-400)   /* -40.0°C in tenths */
 #define TEMP_MAX (1500)   /* 150.0°C in tenths */
 
+#define STR_MAX 32
+
+/*
+ * Everything a UPS publishes that is not battery state.
+ *
+ * None of this belongs in the power_supply class: line voltage, load and
+ * shutdown timers are not properties of a battery, and inventing a second
+ * power supply to carry them is what produced the BAT1 mistake described in
+ * ADR-001 (UPower averaged it into DisplayDevice and reported nonsense).  It
+ * is published read-only under /sys/class/misc/fake_battery_nut/ instead,
+ * where it is available to scripts and monitors without confusing anything
+ * that reads the power_supply class.
+ *
+ * Integer fields are VALUE_UNKNOWN when the UPS does not publish them, and
+ * scaled so no floating point is needed: millivolts, millihertz,
+ * milliamperes, whole seconds, whole percent.  Strings are empty when
+ * unknown.  Field order keeps the ints together so the struct has no interior
+ * padding and can be compared with memcmp().
+ */
+struct ups_extra {
+    int load;                     /* percent */
+    int input_voltage;            /* mV */
+    int output_voltage;           /* mV */
+    int input_frequency;          /* mHz */
+    int input_voltage_nominal;    /* mV */
+    int input_frequency_nominal;  /* mHz */
+    int input_current_nominal;    /* mA */
+    int battery_voltage_nominal;  /* mV */
+    int delay_shutdown;           /* seconds */
+    int delay_start;              /* seconds */
+    int beeper;                   /* 0 disabled, 1 enabled, 2 muted */
+    char mfr[STR_MAX];
+    char model[STR_MAX];
+    char serial[STR_MAX];
+    char ups_type[STR_MAX];
+    char status_raw[STR_MAX];
+};
+
+static struct ups_extra fake_ups_extra = {
+    .load                    = VALUE_UNKNOWN,
+    .input_voltage           = VALUE_UNKNOWN,
+    .output_voltage          = VALUE_UNKNOWN,
+    .input_frequency         = VALUE_UNKNOWN,
+    .input_voltage_nominal   = VALUE_UNKNOWN,
+    .input_frequency_nominal = VALUE_UNKNOWN,
+    .input_current_nominal   = VALUE_UNKNOWN,
+    .battery_voltage_nominal = VALUE_UNKNOWN,
+    .delay_shutdown          = VALUE_UNKNOWN,
+    .delay_start             = VALUE_UNKNOWN,
+    .beeper                  = VALUE_UNKNOWN,
+};
+
+/*
+ * MANUFACTURER, MODEL_NAME and SERIAL_NUMBER are string properties:
+ * get_property hands the power_supply core a pointer, and the core formats it
+ * after we have returned, outside any lock we hold.  Pointing it at a buffer a
+ * concurrent write could be rewriting would let it format a half-updated
+ * string, so the strings are double buffered - writers fill the inactive bank
+ * and then flip the index, and a reader that took the old index keeps reading
+ * a bank nobody is touching.
+ */
+enum { PS_STR_MFR, PS_STR_MODEL, PS_STR_SERIAL, PS_STR_COUNT };
+static char ps_strings[2][PS_STR_COUNT][STR_MAX] = {
+    { "NUT", "UPS Battery", "" },
+    { "NUT", "UPS Battery", "" },
+};
+static int ps_string_bank;
+
 static int
 fake_battery_get_property(struct power_supply *psy,
         enum power_supply_property psp,
@@ -83,6 +151,9 @@ static struct battery_status {
     int time_left;
     int voltage;
     int temp;
+    int voltage_max_design;   /* uV, from the UPS's full/high battery voltage */
+    int voltage_min_design;   /* uV, from the UPS's empty/low battery voltage */
+    int health;               /* POWER_SUPPLY_HEALTH_* */
 } fake_battery_status = {
     .status = POWER_SUPPLY_STATUS_FULL,
     .capacity_level = POWER_SUPPLY_CAPACITY_LEVEL_FULL,
@@ -91,6 +162,9 @@ static struct battery_status {
     .time_left = VALUE_UNKNOWN,
     .voltage = VALUE_UNKNOWN,
     .temp = VALUE_UNKNOWN,
+    .voltage_max_design = VALUE_UNKNOWN,
+    .voltage_min_design = VALUE_UNKNOWN,
+    .health = POWER_SUPPLY_HEALTH_GOOD,
 };
 
 static int ac_status = 1;
@@ -137,6 +211,8 @@ static enum power_supply_property fake_battery_properties[] = {
     POWER_SUPPLY_PROP_SERIAL_NUMBER,
     POWER_SUPPLY_PROP_TEMP,
     POWER_SUPPLY_PROP_VOLTAGE_NOW,
+    POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
+    POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
 };
 
 static enum power_supply_property fake_ac_properties[] = {
@@ -246,7 +322,8 @@ level_to_capacity_level(long level)
  * touched, so a failure here leaves the published state untouched.
  */
 static int
-handle_control_line(char *line, int *ac_status, struct battery_status *battery)
+handle_control_line(char *line, int *ac_status, struct battery_status *battery,
+        struct ups_extra *extra)
 {
     char *key;
     char *key_end;
@@ -281,6 +358,44 @@ handle_control_line(char *line, int *ac_status, struct battery_status *battery)
      */
     while(value_end > value_p && isspace(value_end[-1])) {
         *--value_end = '\0';
+    }
+
+    /*
+     * String-valued keys are handled before the numeric parse, since they are
+     * not numbers.  Anything non-printable is rejected rather than sanitised:
+     * these end up in sysfs, and a control character there is a bug worth
+     * hearing about, not something to quietly paper over.
+     */
+    if(!strcmp(key, "mfr") || !strcmp(key, "model") || !strcmp(key, "serial") ||
+            !strcmp(key, "ups_type") || !strcmp(key, "status_raw")) {
+        char *dest;
+        size_t len = strlen(value_p);
+        size_t i;
+
+        if(len >= STR_MAX) {
+            return -ERANGE;
+        }
+
+        for(i = 0; i < len; i++) {
+            if(!isprint(value_p[i])) {
+                return -EINVAL;
+            }
+        }
+
+        if(!strcmp(key, "mfr")) {
+            dest = extra->mfr;
+        } else if(!strcmp(key, "model")) {
+            dest = extra->model;
+        } else if(!strcmp(key, "serial")) {
+            dest = extra->serial;
+        } else if(!strcmp(key, "ups_type")) {
+            dest = extra->ups_type;
+        } else {
+            dest = extra->status_raw;
+        }
+
+        strscpy(dest, value_p, STR_MAX);
+        return 0;
     }
 
     ret = kstrtol(value_p, 10, &value);
@@ -335,6 +450,89 @@ handle_control_line(char *line, int *ac_status, struct battery_status *battery)
             return -ERANGE;
         }
         battery->temp = value;
+    } else if(!strcmp(key, "voltage_max_design")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        battery->voltage_max_design = value;
+    } else if(!strcmp(key, "voltage_min_design")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        battery->voltage_min_design = value;
+    } else if(!strcmp(key, "health")) {
+        switch(value) {
+            case 0:
+                battery->health = POWER_SUPPLY_HEALTH_GOOD;
+                break;
+            case 1:
+                /* NUT's RB - the UPS is asking for a new battery */
+                battery->health = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
+                break;
+            case 2:
+                battery->health = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
+                break;
+            case 3:
+                battery->health = POWER_SUPPLY_HEALTH_DEAD;
+                break;
+            default:
+                return -ERANGE;
+        }
+    } else if(!strcmp(key, "load")) {
+        if(value < VALUE_UNKNOWN || value > 1000) {
+            return -ERANGE;
+        }
+        extra->load = value;
+    } else if(!strcmp(key, "beeper")) {
+        if(value < VALUE_UNKNOWN || value > 2) {
+            return -ERANGE;
+        }
+        extra->beeper = value;
+    } else if(!strcmp(key, "input_voltage")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->input_voltage = value;
+    } else if(!strcmp(key, "output_voltage")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->output_voltage = value;
+    } else if(!strcmp(key, "input_frequency")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->input_frequency = value;
+    } else if(!strcmp(key, "input_voltage_nominal")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->input_voltage_nominal = value;
+    } else if(!strcmp(key, "input_frequency_nominal")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->input_frequency_nominal = value;
+    } else if(!strcmp(key, "input_current_nominal")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->input_current_nominal = value;
+    } else if(!strcmp(key, "battery_voltage_nominal")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->battery_voltage_nominal = value;
+    } else if(!strcmp(key, "delay_shutdown")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->delay_shutdown = value;
+    } else if(!strcmp(key, "delay_start")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        extra->delay_start = value;
     } else {
         return -EINVAL;
     }
@@ -359,6 +557,7 @@ control_device_write(struct file *file, const char *buffer, size_t count, loff_t
      * daemon, which never seeks.)
      */
     struct battery_status new_status;
+    struct ups_extra new_extra;
     char kbuffer[1025];
     char *buffer_cursor;
     char *newline;
@@ -366,6 +565,8 @@ control_device_write(struct file *file, const char *buffer, size_t count, loff_t
     unsigned long flags;
     bool battery_changed;
     bool ac_changed;
+    bool strings_changed;
+    int bank;
     int new_ac_status;
     int status;
 
@@ -398,6 +599,7 @@ control_device_write(struct file *file, const char *buffer, size_t count, loff_t
 
     spin_lock_irqsave(&fake_battery_lock, flags);
     new_status    = fake_battery_status;
+    new_extra     = fake_ups_extra;
     new_ac_status = ac_status;
     spin_unlock_irqrestore(&fake_battery_lock, flags);
 
@@ -405,7 +607,8 @@ control_device_write(struct file *file, const char *buffer, size_t count, loff_t
 
     while((newline = memchr(buffer_cursor, '\n', bytes_left))) {
         *newline = '\0';
-        status = handle_control_line(buffer_cursor, &new_ac_status, &new_status);
+        status = handle_control_line(buffer_cursor, &new_ac_status, &new_status,
+                &new_extra);
 
         if(status) {
             mutex_unlock(&control_write_lock);
@@ -426,9 +629,36 @@ control_device_write(struct file *file, const char *buffer, size_t count, loff_t
     spin_lock_irqsave(&fake_battery_lock, flags);
     battery_changed = memcmp(&new_status, &fake_battery_status, sizeof(new_status)) != 0;
     ac_changed      = new_ac_status != ac_status;
+    strings_changed = strcmp(new_extra.mfr, fake_ups_extra.mfr) ||
+                      strcmp(new_extra.model, fake_ups_extra.model) ||
+                      strcmp(new_extra.serial, fake_ups_extra.serial);
     fake_battery_status = new_status;
+    fake_ups_extra      = new_extra;
     ac_status           = new_ac_status;
     spin_unlock_irqrestore(&fake_battery_lock, flags);
+
+    /*
+     * Republish the power_supply strings into the inactive bank and flip.
+     * Only writers touch this and they are serialised by control_write_lock,
+     * so the bank being filled is never the one readers are looking at.  An
+     * empty string means "not published", in which case the previous default
+     * is kept rather than showing a blank manufacturer.
+     */
+    if(strings_changed) {
+        bank = !READ_ONCE(ps_string_bank);
+        if(new_extra.mfr[0]) {
+            strscpy(ps_strings[bank][PS_STR_MFR], new_extra.mfr, STR_MAX);
+        }
+        if(new_extra.model[0]) {
+            strscpy(ps_strings[bank][PS_STR_MODEL], new_extra.model, STR_MAX);
+        }
+        if(new_extra.serial[0]) {
+            strscpy(ps_strings[bank][PS_STR_SERIAL], new_extra.serial, STR_MAX);
+        }
+        /* Contents must be visible before the index that publishes them */
+        smp_wmb();
+        WRITE_ONCE(ps_string_bank, bank);
+    }
 
     mutex_unlock(&control_write_lock);
 
@@ -449,10 +679,96 @@ static const struct file_operations control_device_ops = {
     .write = control_device_write,
 };
 
+/*
+ * The UPS telemetry that has no power_supply equivalent, published read-only
+ * under /sys/class/misc/fake_battery_nut/.  A value the UPS does not report
+ * reads as "unknown" rather than as a zero that cannot be told apart from a
+ * real measurement.
+ */
+static ssize_t show_extra_int(char *buf, int value, const char *unit)
+{
+    if(value == VALUE_UNKNOWN) {
+        return sysfs_emit(buf, "unknown\n");
+    }
+
+    return sysfs_emit(buf, "%d%s\n", value, unit);
+}
+
+#define UPS_EXTRA_INT_ATTR(name, field, unit)                                 \
+static ssize_t name##_show(struct device *dev,                                \
+        struct device_attribute *attr, char *buf)                             \
+{                                                                             \
+    struct ups_extra snapshot;                                                \
+    unsigned long flags;                                                      \
+                                                                              \
+    spin_lock_irqsave(&fake_battery_lock, flags);                             \
+    snapshot = fake_ups_extra;                                                \
+    spin_unlock_irqrestore(&fake_battery_lock, flags);                        \
+                                                                              \
+    return show_extra_int(buf, snapshot.field, unit);                         \
+}                                                                             \
+static DEVICE_ATTR_RO(name)
+
+#define UPS_EXTRA_STR_ATTR(name, field)                                       \
+static ssize_t name##_show(struct device *dev,                                \
+        struct device_attribute *attr, char *buf)                             \
+{                                                                             \
+    struct ups_extra snapshot;                                                \
+    unsigned long flags;                                                      \
+                                                                              \
+    spin_lock_irqsave(&fake_battery_lock, flags);                             \
+    snapshot = fake_ups_extra;                                                \
+    spin_unlock_irqrestore(&fake_battery_lock, flags);                        \
+                                                                              \
+    if(!snapshot.field[0]) {                                                  \
+        return sysfs_emit(buf, "unknown\n");                                  \
+    }                                                                         \
+                                                                              \
+    return sysfs_emit(buf, "%s\n", snapshot.field);                           \
+}                                                                             \
+static DEVICE_ATTR_RO(name)
+
+UPS_EXTRA_INT_ATTR(load,                    load,                    " %");
+UPS_EXTRA_INT_ATTR(input_voltage,           input_voltage,           " mV");
+UPS_EXTRA_INT_ATTR(output_voltage,          output_voltage,          " mV");
+UPS_EXTRA_INT_ATTR(input_frequency,         input_frequency,         " mHz");
+UPS_EXTRA_INT_ATTR(input_voltage_nominal,   input_voltage_nominal,   " mV");
+UPS_EXTRA_INT_ATTR(input_frequency_nominal, input_frequency_nominal, " mHz");
+UPS_EXTRA_INT_ATTR(input_current_nominal,   input_current_nominal,   " mA");
+UPS_EXTRA_INT_ATTR(battery_voltage_nominal, battery_voltage_nominal, " mV");
+UPS_EXTRA_INT_ATTR(delay_shutdown,          delay_shutdown,          " s");
+UPS_EXTRA_INT_ATTR(delay_start,             delay_start,             " s");
+UPS_EXTRA_INT_ATTR(beeper,                  beeper,                  "");
+UPS_EXTRA_STR_ATTR(ups_type,                ups_type);
+UPS_EXTRA_STR_ATTR(status_raw,              status_raw);
+UPS_EXTRA_STR_ATTR(manufacturer,            mfr);
+UPS_EXTRA_STR_ATTR(model,                   model);
+
+static struct attribute *fake_battery_nut_attrs[] = {
+    &dev_attr_load.attr,
+    &dev_attr_input_voltage.attr,
+    &dev_attr_output_voltage.attr,
+    &dev_attr_input_frequency.attr,
+    &dev_attr_input_voltage_nominal.attr,
+    &dev_attr_input_frequency_nominal.attr,
+    &dev_attr_input_current_nominal.attr,
+    &dev_attr_battery_voltage_nominal.attr,
+    &dev_attr_delay_shutdown.attr,
+    &dev_attr_delay_start.attr,
+    &dev_attr_beeper.attr,
+    &dev_attr_ups_type.attr,
+    &dev_attr_status_raw.attr,
+    &dev_attr_manufacturer.attr,
+    &dev_attr_model.attr,
+    NULL,
+};
+ATTRIBUTE_GROUPS(fake_battery_nut);
+
 static struct miscdevice control_device = {
-    MISC_DYNAMIC_MINOR,
-    "fake_battery_nut",
-    &control_device_ops,
+    .minor  = MISC_DYNAMIC_MINOR,
+    .name   = "fake_battery_nut",
+    .fops   = &control_device_ops,
+    .groups = fake_battery_nut_groups,
 };
 
 static int
@@ -469,13 +785,16 @@ fake_battery_get_property(struct power_supply *psy,
 
     switch (psp) {
         case POWER_SUPPLY_PROP_MANUFACTURER:
-            val->strval = "NUT";
+            val->strval = ps_strings[READ_ONCE(ps_string_bank)][PS_STR_MFR];
             break;
         case POWER_SUPPLY_PROP_MODEL_NAME:
-            val->strval = "UPS Battery";
+            val->strval = ps_strings[READ_ONCE(ps_string_bank)][PS_STR_MODEL];
             break;
         case POWER_SUPPLY_PROP_SERIAL_NUMBER:
-            val->strval = "NUT-UPS";
+            val->strval = ps_strings[READ_ONCE(ps_string_bank)][PS_STR_SERIAL];
+            if(!val->strval[0]) {
+                return -ENODATA;
+            }
             break;
         case POWER_SUPPLY_PROP_STATUS:
             val->intval = status.status;
@@ -484,7 +803,7 @@ fake_battery_get_property(struct power_supply *psy,
             val->intval = POWER_SUPPLY_CHARGE_TYPE_FAST;
             break;
         case POWER_SUPPLY_PROP_HEALTH:
-            val->intval = POWER_SUPPLY_HEALTH_GOOD;
+            val->intval = status.health;
             break;
         case POWER_SUPPLY_PROP_PRESENT:
             /*
@@ -522,6 +841,18 @@ fake_battery_get_property(struct power_supply *psy,
                 return -ENODATA;
             }
             val->intval = status.temp;
+            break;
+        case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
+            if(status.voltage_max_design == VALUE_UNKNOWN) {
+                return -ENODATA;
+            }
+            val->intval = status.voltage_max_design;
+            break;
+        case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
+            if(status.voltage_min_design == VALUE_UNKNOWN) {
+                return -ENODATA;
+            }
+            val->intval = status.voltage_min_design;
             break;
         case POWER_SUPPLY_PROP_VOLTAGE_NOW:
             if(status.voltage < 0) {
@@ -615,4 +946,4 @@ module_exit(fake_battery_nut_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("NUT UPS to Linux power_supply bridge");
 MODULE_AUTHOR("Based on linux-fake-battery-module by Rob Hoelz");
-MODULE_VERSION("1.3.0");
+MODULE_VERSION("1.4.0");
