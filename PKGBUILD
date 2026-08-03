@@ -1,6 +1,6 @@
 # Maintainer: Aaron Bockelie <aaronsb@gmail.com>
 pkgname=fake-battery-nut-dkms
-pkgver=1.2.0
+pkgver=1.3.0
 pkgrel=1
 pkgdesc="Bridge NUT UPS data to UPower/desktop - makes any UPS look like a laptop battery"
 arch=('x86_64')
@@ -10,7 +10,10 @@ depends=('dkms' 'nut')
 makedepends=('linux-headers')
 install=${pkgname}.install
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/aaronsb/fake-battery-nut/archive/v${pkgver}.tar.gz")
-sha256sums=('30545667d6f1de043d907fe3db533f04b14f50960fba6048d0c194ade4fdf747')
+# Placeholder: regenerate with `updpkgsums` once the v1.3.0 tarball is tagged.
+# Left deliberately wrong rather than SKIP, so a build against an unreleased
+# tag fails loudly instead of silently skipping verification.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
 package() {
     cd "$srcdir/fake-battery-nut-${pkgver}"

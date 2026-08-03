@@ -6,7 +6,7 @@
 # UPS battery status.
 #
 # Control interface (one key=value per line, written as a single write):
-#   capacity  0..100
+#   capacity  0..100, or -1 = unknown
 #   status    0=discharging 1=charging 2=full
 #   charging  0..1                    (AC online)
 #   level     0=derive from capacity, 1=critical, 2=low, 3=normal, 4=high, 5=full
@@ -31,7 +31,7 @@ MAX_POLL_FAILURES=5
 
 # Capacity written while the UPS asserts LB (low battery) or FSD.
 #
-# Policy, deliberate: this host runs UPower with PercentageAction=2.0 and
+# Policy, deliberate: UPower is commonly configured with PercentageAction=2 and
 # CriticalPowerAction=PowerOff, so clamping to <= 2 would make UPower power the
 # machine off - duplicating the shutdown upsmon already performs off the very
 # same LB signal, and turning a spurious or flapping LB into an immediate
@@ -60,8 +60,8 @@ fi
 
 # Extract everything of interest from one upsc capture in a single awk pass.
 # Emits exactly five lines, in order:
-#   1 capacity   integer 0..100, or empty when unknown (the module has no
-#                unknown sentinel for capacity, so the key is then omitted)
+#   1 capacity   integer 0..100, or -1 when the UPS publishes no usable
+#                battery.charge
 #   2 time       seconds, or -1
 #   3 voltage    microvolts, or -1
 #   4 temp       tenths of a degree C, or -1
@@ -88,9 +88,13 @@ parse_nut() {
             cap = "-1"
             if (isnum(charge)) {
                 c = charge + 0
-                if (c < 0)   c = 0
+                # A negative charge is not a flat battery, it is a broken
+                # reading, and 0 is the most dangerous value to guess: it is
+                # what a critical-power action fires on. Report it unknown,
+                # like every other out-of-band field. Clamping down from
+                # above 100 is safe, so that one stays a clamp.
                 if (c > 100) c = 100
-                cap = sprintf("%.0f", c)
+                if (c >= 0)  cap = sprintf("%.0f", c)
             }
 
             secs = "-1"
@@ -253,7 +257,7 @@ while true; do
     elif [ "$WRITE_FAILED" -eq 0 ]; then
         # Edge-triggered: the module rejects a batch wholesale, and repeating
         # that every 2 s would only flood the journal.
-        log "Write to $DEVICE rejected (status=$STATUS_VAL charging=$AC_STATUS level=$LEVEL capacity=${CAPACITY:-unset})"
+        log "Write to $DEVICE rejected (capacity=$CAPACITY status=$STATUS_VAL charging=$AC_STATUS level=$LEVEL)"
         WRITE_FAILED=1
     fi
 

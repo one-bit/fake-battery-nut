@@ -1,6 +1,6 @@
 pkgbase = fake-battery-nut-dkms
 	pkgdesc = Bridge NUT UPS data to UPower/desktop - makes any UPS look like a laptop battery
-	pkgver = 1.2.0
+	pkgver = 1.3.0
 	pkgrel = 1
 	url = https://github.com/aaronsb/fake-battery-nut
 	install = fake-battery-nut-dkms.install
@@ -9,7 +9,7 @@ pkgbase = fake-battery-nut-dkms
 	makedepends = linux-headers
 	depends = dkms
 	depends = nut
-	source = fake-battery-nut-dkms-1.2.0.tar.gz::https://github.com/aaronsb/fake-battery-nut/archive/v1.2.0.tar.gz
-	sha256sums = 30545667d6f1de043d907fe3db533f04b14f50960fba6048d0c194ade4fdf747
+	source = fake-battery-nut-dkms-1.3.0.tar.gz::https://github.com/aaronsb/fake-battery-nut/archive/v1.3.0.tar.gz
+	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
 
 pkgname = fake-battery-nut-dkms

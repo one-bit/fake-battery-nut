@@ -81,7 +81,35 @@ dkms install -m "$MODULE_NAME" -v "$VERSION" --force
 echo "Configuring module autoload..."
 echo "fake_battery_nut" > /etc/modules-load.d/fake-battery-nut.conf
 
-# Load module now
+# Load the module, replacing an older build if one is already resident.
+#
+# This matters more than it looks. modprobe is a silent no-op when the module
+# is already loaded, and the daemon below IS replaced unconditionally - so
+# without this an upgrade leaves the new daemon talking to the old module.
+# That pairing is worse than either version alone: the daemon speaks a control
+# grammar the old module does not implement, and values the old module has no
+# validation for (such as the -1 unknown sentinel) get published verbatim as
+# battery state.
+LOADED_VERSION=""
+if [ -e /sys/module/fake_battery_nut/version ]; then
+    LOADED_VERSION=$(cat /sys/module/fake_battery_nut/version)
+elif [ -d /sys/module/fake_battery_nut ]; then
+    # Loaded, but built before MODULE_VERSION existed - definitely stale.
+    LOADED_VERSION="unknown"
+fi
+
+if [ -n "$LOADED_VERSION" ] && [ "$LOADED_VERSION" != "$VERSION" ]; then
+    echo "Replacing loaded module (${LOADED_VERSION} -> ${VERSION})..."
+    # Stop the daemon first so it is not writing to a device about to vanish.
+    systemctl stop fake-battery-nut 2>/dev/null || true
+    if ! rmmod fake_battery_nut; then
+        echo "ERROR: could not unload the running fake_battery_nut module."
+        echo "Something still has it open. Stop anything using"
+        echo "/dev/fake_battery_nut and re-run, or reboot to complete the upgrade."
+        exit 1
+    fi
+fi
+
 modprobe fake_battery_nut 2>/dev/null || insmod "$(modinfo -n fake_battery_nut)"
 
 # No udev rule is installed. /dev/fake_battery_nut is the module's only write
