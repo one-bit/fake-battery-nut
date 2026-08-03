@@ -83,11 +83,14 @@ make
 # Install module
 sudo make install
 
-# Or use DKMS
-sudo cp -r . /usr/src/fake-battery-nut-1.1.0
-sudo dkms add fake-battery-nut/1.1.0
-sudo dkms build fake-battery-nut/1.1.0
-sudo dkms install fake-battery-nut/1.1.0
+# Or use DKMS - take the version from dkms.conf rather than pasting a literal,
+# because a staged tree whose directory version disagrees with its own dkms.conf
+# is rejected by `dkms add`, and the error does not say why.
+VERSION=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)
+sudo cp -r . "/usr/src/fake-battery-nut-$VERSION"
+sudo dkms add "fake-battery-nut/$VERSION"
+sudo dkms build "fake-battery-nut/$VERSION"
+sudo dkms install "fake-battery-nut/$VERSION"
 
 # Install daemon
 sudo install -m755 nut-to-fakebattery.sh /usr/bin/nut-to-fakebattery
@@ -100,40 +103,100 @@ sudo systemctl enable --now fake-battery-nut
 
 ## Configuration
 
-Edit `/etc/systemd/system/fake-battery-nut.service` to set your UPS:
+The daemon is configured entirely through the environment in its unit file -
+`/etc/systemd/system/fake-battery-nut.service` for a manual install, or
+`sudo systemctl edit fake-battery-nut` if the AUR package put it under `/usr/lib`:
 
 ```ini
 Environment=NUT_UPS=myups@localhost
+Environment=NUT_LB_CAPACITY=5
 ```
+
+- **`NUT_UPS`** - the `upsname@host` the daemon polls. Default `cyberpower@localhost`,
+  which is almost certainly not yours; `upsc -l` lists what NUT actually has.
+- **`NUT_LB_CAPACITY`** - the capacity percentage reported while the UPS asserts `LB`
+  (low battery) or `FSD`. Default `5`.
+
+`LB` is the flag `upsmon` itself acts on, so the daemon does not let it pass silently: it
+sets the capacity level to critical *and* clamps the reported percentage, because UPower
+with `UsePercentageForPolicy=true` derives its warning level from the percentage and would
+otherwise ignore the level entirely. The default of 5 is deliberately low enough to raise a
+critical-battery warning but above the usual `PercentageAction` threshold of 2 - `upsmon`
+stays the authority on shutdown, and UPower's `CriticalPowerAction` stays a backstop that
+only fires if the charge really does keep falling. Lower it only if you want UPower, rather
+than NUT, deciding when the machine goes down.
 
 ## Control Interface
 
-Write to `/dev/fake_battery_nut` to set values:
+Write `key=value` lines to `/dev/fake_battery_nut`. Every line must end with a newline:
 
 ```bash
-echo "capacity=100" | sudo tee /dev/fake_battery_nut    # Battery capacity %
-echo "time=1800" | sudo tee /dev/fake_battery_nut       # Runtime in seconds
-echo "voltage=24000000" | sudo tee /dev/fake_battery_nut # Voltage in µV
-echo "temp=260" | sudo tee /dev/fake_battery_nut        # Temperature (tenths of °C)
-echo "status=2" | sudo tee /dev/fake_battery_nut        # 0=discharge, 1=charge, 2=full
-echo "charging=1" | sudo tee /dev/fake_battery_nut      # AC online status
+echo "capacity=100" | sudo tee /dev/fake_battery_nut     # Battery capacity, 0-100 %
+echo "status=2" | sudo tee /dev/fake_battery_nut         # 0=discharging, 1=charging, 2=full
+echo "charging=1" | sudo tee /dev/fake_battery_nut       # AC online, 0 or 1
+echo "level=0" | sudo tee /dev/fake_battery_nut          # Capacity level override, see below
+echo "time=1800" | sudo tee /dev/fake_battery_nut        # Runtime in seconds, or -1
+echo "voltage=24000000" | sudo tee /dev/fake_battery_nut # Voltage in µV, or -1
+echo "temp=260" | sudo tee /dev/fake_battery_nut         # Temperature in tenths of °C, or -1
 ```
+
+**`level=N` overrides the capacity level** that the module otherwise derives from `capacity`:
+
+| N | Capacity level |
+|---|----------------|
+| 0 | derive from capacity (the default) |
+| 1 | critical |
+| 2 | low |
+| 3 | normal |
+| 4 | high |
+| 5 | full |
+
+A non-zero level stays in force until `level=0` is written again; the derived level keeps
+tracking capacity underneath, so clearing the override takes effect immediately. This exists
+so the daemon can state outright that the UPS said `LB`, instead of hoping the reported
+percentage happens to have fallen far enough for anyone to notice.
+
+**`-1` means "unknown"** for `time`, `voltage` and `temp`. The module returns `-ENODATA` for
+that property, so the sysfs attribute errors out and UPower omits the value rather than being
+handed a fabricated one. All three start out unknown at load - nothing is known until the
+daemon says so. A UPS that never publishes `battery.runtime` therefore produces no
+`time_to_empty_avg` at all, instead of a stately, permanent, entirely invented "1 hour remaining".
+
+**Values are range-checked and a write is transactional.** `capacity` 0-100, `status` 0-2,
+`charging` 0-1, `level` 0-5, `temp` -400 to 1500 tenths of °C, `time` and `voltage` -1 or any
+non-negative value. Out of range is `-ERANGE`; an unknown key, or a line without an `=`, is
+`-EINVAL`. Keys are matched exactly, so `capacity_level=3` is an error rather than a silent
+`capacity=3`. The whole batch is parsed into a private copy of the state and committed only if
+every line validated - one bad line rejects the entire write and leaves the published state
+exactly as it was.
 
 ## Data Mapping
 
 | NUT Field | Control Command | power_supply Property |
 |-----------|-----------------|----------------------|
 | battery.charge | capacity | BAT0/capacity |
-| battery.runtime | time | BAT0/time_to_empty_avg |
+| battery.runtime | time | BAT0/time_to_empty_avg, BAT0/time_to_full_now |
 | battery.voltage | voltage | BAT0/voltage_now |
-| ups.status (OL/OB) | status, charging | BAT0/status, AC0/online |
-| (optional) | temp | BAT0/temp |
+| battery.temperature (or ups.temperature) | temp | BAT0/temp |
+| ups.status `OL`/`OB` | status, charging | BAT0/status, AC0/online |
+| ups.status `CHRG`/`DISCHRG` | status | BAT0/status |
+| ups.status `LB`/`FSD` | level, clamped capacity | BAT0/capacity_level, BAT0/capacity |
+
+Status flags are matched as whole whitespace-delimited tokens, for the excellent reason that
+`DISCHRG` contains `CHRG`.
+
+**Deliberately not mapped:** `CHARGE_NOW`, `CHARGE_FULL` and `CHARGE_FULL_DESIGN` used to carry
+the capacity percentage. The power_supply class defines those in µAh, so UPower dutifully
+multiplied by the voltage and advertised a 0.00276 Wh battery. They are gone. Percentage stands
+alone, which is all UPower wanted in the first place.
 
 ## Requirements
 
 - Linux kernel headers
 - NUT (nut package)
-- bc (for voltage conversion in daemon)
+- bash 4+ and awk (both already on any system that has NUT). The daemon used to
+  shell out to `bc` for one multiplication; it now does the extraction and the
+  volts-to-microvolts scaling in a single `awk` pass, so `bc` is no longer a dependency.
 
 ## License
 

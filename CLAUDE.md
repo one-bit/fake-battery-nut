@@ -31,8 +31,13 @@ So we built a kernel module to bridge the gap.
 We forked [linux-fake-battery-module](https://github.com/hoelzro/linux-fake-battery-module) and enhanced it to:
 - Accept more control commands (time, voltage, status)
 - Rename the device to `/dev/fake_battery_nut`
-- Label batteries as "UPS Battery" and "UPS Load"
+- Label the battery as "UPS Battery"
 - Set up DKMS for kernel update survival
+
+A second pseudo-battery labelled "UPS Load" was in the first cut and was removed in v1.1.0:
+UPower averaged it into its `DisplayDevice`, so a 100% UPS reporting 21% load showed up on the
+desktop as a 34% battery. Load monitoring lives in `upsc` now, where it always belonged. See
+[ADR-001](docs/architecture/001-extended-nut-data-mapping.md).
 
 A daemon script reads from NUT and writes to the kernel module. btop now shows UPS stats as battery info.
 
@@ -67,7 +72,10 @@ sudo systemctl start fake-battery-nut
 
 # Check values
 cat /sys/class/power_supply/BAT0/capacity  # UPS battery %
-cat /sys/class/power_supply/BAT1/capacity  # UPS load %
+cat /sys/class/power_supply/AC0/online     # 1 = on mains, 0 = on battery
+
+# Load % is not a battery, so it is not here. Ask NUT directly:
+upsc "${NUT_UPS:-cyberpower@localhost}" ups.load
 ```
 
 ## Lessons Learned
