@@ -2,10 +2,25 @@
 # fake-battery-nut installer
 set -e
 
-VERSION="1.0.0"
-SRCDIR="/usr/src/fake-battery-nut-${VERSION}"
+MODULE_NAME="fake-battery-nut"
 
-echo "=== Installing fake-battery-nut v${VERSION} ==="
+# Run from the directory holding this script, so the sources and dkms.conf are
+# found no matter where the installer was invoked from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Single source of truth for the version: dkms.conf. Hardcoding it here means
+# 'dkms add' asserts a version the staged tree does not declare, and DKMS
+# rejects it.
+VERSION=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)
+if [ -z "$VERSION" ]; then
+    echo "ERROR: could not read PACKAGE_VERSION from ${SCRIPT_DIR}/dkms.conf"
+    exit 1
+fi
+
+SRCDIR="/usr/src/${MODULE_NAME}-${VERSION}"
+
+echo "=== Installing ${MODULE_NAME} v${VERSION} ==="
 
 # Check for root
 if [ "$EUID" -ne 0 ]; then
@@ -37,9 +52,17 @@ cp fake_battery_nut.c "$SRCDIR/"
 cp Makefile "$SRCDIR/"
 cp dkms.conf "$SRCDIR/"
 
-dkms add -m fake-battery-nut -v "$VERSION" 2>/dev/null || true
-dkms build -m fake-battery-nut -v "$VERSION"
-dkms install -m fake-battery-nut -v "$VERSION" --force
+# Skip 'dkms add' only when this exact module/version is already registered.
+# Every other failure must surface with its output intact - swallowing it hides
+# the real diagnostic and the script then dies later inside 'dkms build' for a
+# reason that reads as unrelated.
+if [ -n "$(dkms status -m "$MODULE_NAME" -v "$VERSION" 2>/dev/null)" ]; then
+    echo "  ${MODULE_NAME}/${VERSION} already registered with DKMS, skipping 'dkms add'"
+else
+    dkms add -m "$MODULE_NAME" -v "$VERSION"
+fi
+dkms build -m "$MODULE_NAME" -v "$VERSION"
+dkms install -m "$MODULE_NAME" -v "$VERSION" --force
 
 # Auto-load module on boot
 echo "Configuring module autoload..."
