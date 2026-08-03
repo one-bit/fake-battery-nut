@@ -29,6 +29,11 @@ package() {
     # Module autoload
     install -Dm644 /dev/stdin "${pkgdir}/usr/lib/modules-load.d/fake-battery-nut.conf" <<< "fake_battery_nut"
 
-    # Udev rule for device permissions
-    install -Dm644 /dev/stdin "${pkgdir}/usr/lib/udev/rules.d/99-fake-battery-nut.rules" <<< 'KERNEL=="fake_battery_nut", MODE="0666"'
+    # No udev rule is installed. /dev/fake_battery_nut is the module's unauthenticated
+    # control interface - whatever is written to it becomes the machine's battery state,
+    # which UPower acts on (CriticalPowerAction). The only writer is the daemon, running
+    # as root, so the miscdevice default of 0600 root:root is correct. Earlier releases
+    # shipped MODE="0666" here, which let any local user trigger a critical-battery
+    # shutdown. pacman drops the old rule file on upgrade; the .install hook re-triggers
+    # udev so the live node loses those permissions without waiting for a reboot.
 }

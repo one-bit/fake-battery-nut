@@ -17,6 +17,18 @@ post_upgrade() {
     dkms remove fake-battery-nut --all 2>/dev/null || true
     dkms install fake-battery-nut/$1
 
+    # Releases before this one shipped a udev rule putting /dev/fake_battery_nut at
+    # MODE="0666" - an unauthenticated control interface any local user could write to
+    # in order to fake a critical battery and trigger UPower's power-off action. pacman
+    # removes the rule file itself; re-trigger udev so the already-created device node
+    # drops back to the 0600 default now rather than at the next reboot.
+    if [ -e /etc/udev/rules.d/99-fake-battery-nut.rules ]; then
+        echo ">>> Removing stale world-writable udev rule from a manual install..."
+        rm -f /etc/udev/rules.d/99-fake-battery-nut.rules
+    fi
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=misc 2>/dev/null || true
+
     echo ">>> Restarting fake-battery-nut service..."
     systemctl daemon-reload
     systemctl restart fake-battery-nut.service 2>/dev/null || true
