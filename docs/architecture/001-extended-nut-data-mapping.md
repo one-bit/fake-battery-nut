@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (Partially Implemented)
+Accepted (Partially Implemented) — **partially superseded by v1.3.0, see the addendum at the end.**
+The body below describes v1.1.0 and is kept as the historical record of that decision; where it and
+the addendum disagree, the addendum is current.
 
 ## Context
 
@@ -137,6 +139,38 @@ Changes in v1.1.0:
 We wrote a kernel module because btop doesn't have plugins. btop displays `BAT= 100%`. But accidentally, we built the missing bridge between NUT and desktop power management that nobody else bothered to make.
 
 The walnut-powered PC image remains canonical.
+
+## Addendum (v1.3.0)
+
+The mapping table and the "Consequences" section above are v1.1.0. What changed since:
+
+**There is no placeholder data any more.** Option D described temperature as "left as settable
+placeholder (defaults to 26.0 °C)", and the same was true of runtime (3600 s) and voltage (24 V).
+Those defaults were invented figures published as though measured — a UPS with no `battery.runtime`
+advertised a permanent, unmoving "1 hour remaining". `capacity`, `time`, `voltage` and `temp` now
+take a `-1` sentinel meaning "the UPS does not publish this", and the module returns `-ENODATA` for
+the matching property so the attribute is simply absent. The daemon emits `temp` from
+`battery.temperature`, falling back to `ups.temperature`, and `-1` when neither exists.
+
+**An unknown capacity also reports the battery as not present**, with capacity level `Unknown`.
+Measured on 2026-08-03: with `capacity` returning `-ENODATA` and no `CHARGE_*` properties left to
+derive from, UPower reports the battery at **0%** — indistinguishable from flat, and enough to trigger
+a critical-power action. Reporting it absent keeps `warning-level` at `none`. The device is not
+dropped: `line_power_AC0` and the mains signal survive.
+
+**`level=N` was added** as an explicit capacity-level override (0 = derive from capacity, 1..5 =
+critical..full), because NUT's `LB` flag — the signal `upsmon` itself shuts down on — previously
+reached nothing. The daemon now maps `LB`/`FSD` to `level=1` plus a capacity clamped to
+`NUT_LB_CAPACITY` (default 5), since UPower derives its warning level from the percentage when
+`UsePercentageForPolicy` is set, so the level alone changes nothing.
+
+**Properties removed.** `CHARGE_NOW`/`CHARGE_FULL`/`CHARGE_FULL_DESIGN` held a percentage while the
+class defines them in µAh, which is where the `energy: 0.00276 Wh` reading came from.
+`TIME_TO_FULL_NOW` was serving the *discharge* runtime, telling anything reading a charging battery
+it would be full in however long it had left.
+
+Option D (temperature from hwmon) remains deferred and is now moot for the placeholder reason given
+above: absent a real reading, the module reports nothing rather than 26.0 °C.
 
 ## References
 

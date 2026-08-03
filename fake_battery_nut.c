@@ -125,8 +125,13 @@ static enum power_supply_property fake_battery_properties[] = {
     POWER_SUPPLY_PROP_TECHNOLOGY,
     POWER_SUPPLY_PROP_CAPACITY,
     POWER_SUPPLY_PROP_CAPACITY_LEVEL,
+    /*
+     * Only time-to-empty. NUT's battery.runtime is the discharge estimate;
+     * there is no time-to-full figure behind it, and reporting the discharge
+     * runtime as TIME_TO_FULL_NOW told anything reading a charging battery
+     * that it would be full in however long it had left.
+     */
     POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
-    POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
     POWER_SUPPLY_PROP_MODEL_NAME,
     POWER_SUPPLY_PROP_MANUFACTURER,
     POWER_SUPPLY_PROP_SERIAL_NUMBER,
@@ -507,7 +512,6 @@ fake_battery_get_property(struct power_supply *psy,
             val->intval = status.capacity;
             break;
         case POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:
-        case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
             if(status.time_left < 0) {
                 return -ENODATA;
             }
@@ -558,12 +562,13 @@ fake_battery_nut_init(void)
     int result;
     int i;
 
-    result = misc_register(&control_device);
-    if(result) {
-        printk(KERN_ERR "Unable to register misc device!\n");
-        return result;
-    }
-
+    /*
+     * Register the supplies before the control device, not after.  The write
+     * handler calls power_supply_changed() on both supplies, so a write
+     * arriving between misc_register() and the loop below would dereference a
+     * NULL supplies[] entry.  The window is tiny, but the ordering rule is
+     * free: publish the interface only once everything behind it exists.
+     */
     for(i = 0; i < ARRAY_SIZE(descriptions); i++) {
         supplies[i] = power_supply_register(NULL, &descriptions[i], &configs[i]);
         if(IS_ERR(supplies[i])) {
@@ -574,6 +579,12 @@ fake_battery_nut_init(void)
         }
     }
 
+    result = misc_register(&control_device);
+    if(result) {
+        printk(KERN_ERR "Unable to register misc device: %d\n", result);
+        goto error;
+    }
+
     printk(KERN_INFO "fake_battery_nut: loaded - NUT UPS to power_supply bridge\n");
     return 0;
 
@@ -581,7 +592,6 @@ error:
     while(--i >= 0) {
         power_supply_unregister(supplies[i]);
     }
-    misc_deregister(&control_device);
     return result;
 }
 

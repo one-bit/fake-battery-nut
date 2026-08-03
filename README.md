@@ -189,7 +189,7 @@ exactly as it was.
 | NUT Field | Control Command | power_supply Property |
 |-----------|-----------------|----------------------|
 | battery.charge | capacity | BAT0/capacity, BAT0/present |
-| battery.runtime | time | BAT0/time_to_empty_avg, BAT0/time_to_full_now |
+| battery.runtime | time | BAT0/time_to_empty_avg |
 | battery.voltage | voltage | BAT0/voltage_now |
 | battery.temperature (or ups.temperature) | temp | BAT0/temp |
 | ups.status `OL`/`OB` | status, charging | BAT0/status, AC0/online |
@@ -203,6 +203,10 @@ Status flags are matched as whole whitespace-delimited tokens, for the excellent
 the capacity percentage. The power_supply class defines those in µAh, so UPower dutifully
 multiplied by the voltage and advertised a 0.00276 Wh battery. They are gone. Percentage stands
 alone, which is all UPower wanted in the first place.
+
+`TIME_TO_FULL_NOW` is gone for the same reason. NUT's `battery.runtime` is a discharge estimate,
+and there is no time-to-full figure anywhere behind it - reporting one meant telling anything that
+asked about a charging battery it would be full in however long it had left to live.
 
 ## Requirements
 

@@ -24,7 +24,8 @@ UPS="${NUT_UPS:-cyberpower@localhost}"
 # Seconds between polls, and how many consecutive failed polls are tolerated
 # before the daemon gives up. A dead upsd/driver otherwise leaves the module
 # serving its last values forever, which the desktop cannot distinguish from a
-# healthy UPS on mains. Exiting non-zero hands the problem to systemd's
+# healthy UPS on mains. On giving up the daemon clears the module's state (see
+# publish_unknown) and exits non-zero, which hands the problem to systemd's
 # Restart=on-failure and makes it visible in `systemctl status`.
 POLL_INTERVAL=2
 MAX_POLL_FAILURES=5
@@ -43,6 +44,22 @@ LB_CAPACITY="${NUT_LB_CAPACITY:-5}"
 
 log() {
     logger -t nut-to-fakebattery "$@"
+}
+
+# Tell the module we no longer know anything, then leave.
+#
+# Exiting alone is not enough: the module goes on publishing whatever it was
+# last told, so a dead upsd looks exactly like a healthy UPS sitting on mains
+# at 100%. Systemd knows the daemon failed; the desktop does not, and the
+# desktop is the whole point of this bridge. Clearing capacity to the unknown
+# sentinel makes the battery report itself absent, which is at least true.
+#
+# status and charging are deliberately left alone - there is no "unknown" for
+# either, and an absent battery already says enough. level is cleared so a
+# stale LB override cannot outlive the data it came from.
+publish_unknown() {
+    printf 'capacity=-1\ntime=-1\nvoltage=-1\ntemp=-1\nlevel=0\n' > "$DEVICE" 2>/dev/null \
+        || log "Could not clear $DEVICE on the way out; it keeps its last values"
 }
 
 # A non-integer or out-of-range clamp would be rejected by the module and take
@@ -161,6 +178,7 @@ while true; do
         POLL_FAILURES=$((POLL_FAILURES + 1))
         if [ "$POLL_FAILURES" -ge "$MAX_POLL_FAILURES" ]; then
             log "No data from $UPS for $POLL_FAILURES consecutive polls; exiting for restart"
+            publish_unknown
             exit 1
         fi
         sleep "$POLL_INTERVAL"
@@ -176,6 +194,7 @@ while true; do
         POLL_FAILURES=$((POLL_FAILURES + 1))
         if [ "$POLL_FAILURES" -ge "$MAX_POLL_FAILURES" ]; then
             log "Could not parse upsc output for $POLL_FAILURES consecutive polls; exiting for restart"
+            publish_unknown
             exit 1
         fi
         sleep "$POLL_INTERVAL"
