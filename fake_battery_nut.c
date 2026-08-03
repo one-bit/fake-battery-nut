@@ -5,13 +5,37 @@
  * Modified to support NUT (Network UPS Tools) data passthrough
  *
  * Control interface: /dev/fake_battery_nut
- * Commands:
- *   capacity=N    - Set battery capacity (0-100) - maps to UPS battery charge
- *   time=N        - Set time_to_empty in seconds - maps to UPS runtime
- *   voltage=N     - Set voltage in microvolts
- *   temp=N        - Set temperature in tenths of °C (e.g., 260 = 26.0°C)
+ *
+ * Commands are "key=value" lines, one per line, newline terminated, delivered
+ * in a single write().  A write is transactional: every line is parsed and
+ * validated into a private copy of the state, and that copy is committed only
+ * if the whole write validated.  A rejected write leaves the published state
+ * completely unchanged.
+ *
+ *   capacity=N    - Battery capacity, 0-100 percent - maps to UPS battery charge
  *   status=N      - Set status (0=discharging, 1=charging, 2=full)
  *   charging=N    - Set AC online status (0=offline, 1=online)
+ *   level=N       - Capacity level override, 0-5:
+ *                     0 = derive from capacity (the default),
+ *                     1 = critical, 2 = low, 3 = normal, 4 = high, 5 = full
+ *                   A non-zero level overrides the capacity-derived level
+ *                   until level=0 is written again.  The derived level keeps
+ *                   tracking capacity in the background while overridden, so
+ *                   clearing the override does the right thing immediately.
+ *   time=N        - Set time_to_empty in seconds - maps to UPS runtime,
+ *                   or -1 = unknown
+ *   voltage=N     - Set voltage in microvolts, or -1 = unknown
+ *   temp=N        - Set temperature in tenths of °C (e.g., 260 = 26.0°C),
+ *                   range -400..1500, or -1 = unknown
+ *
+ * The -1 sentinel means "the UPS does not publish this".  The matching
+ * property then reports -ENODATA, so the sysfs attribute errors out and
+ * consumers such as UPower omit the value instead of being handed a
+ * fabricated one.  time, voltage and temp all start out unknown at load time
+ * for exactly that reason - nothing is known until the daemon says so.
+ *
+ * Keys are matched exactly.  An unrecognised key is rejected with -EINVAL, a
+ * line with no '=' with -EINVAL, and an out-of-range value with -ERANGE.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,13 +43,24 @@
  * (at your option) any later version.
  */
 
+#include <linux/ctype.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
+#include <linux/limits.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/power_supply.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
+
+/* Value meaning "the UPS does not publish this" for time, voltage and temp */
+#define VALUE_UNKNOWN (-1)
+
+#define TEMP_MIN (-400)   /* -40.0°C in tenths */
+#define TEMP_MAX (1500)   /* 150.0°C in tenths */
 
 static int
 fake_battery_get_property(struct power_supply *psy,
@@ -39,7 +74,8 @@ fake_ac_get_property(struct power_supply *psy,
 
 static struct battery_status {
     int status;
-    int capacity_level;
+    int capacity_level;           /* always derived from capacity */
+    int capacity_level_override;  /* 0 = none, else POWER_SUPPLY_CAPACITY_LEVEL_* */
     int capacity;
     int time_left;
     int voltage;
@@ -47,13 +83,32 @@ static struct battery_status {
 } fake_battery_status = {
     .status = POWER_SUPPLY_STATUS_FULL,
     .capacity_level = POWER_SUPPLY_CAPACITY_LEVEL_FULL,
+    .capacity_level_override = 0,
     .capacity = 100,
-    .time_left = 3600,
-    .voltage = 24000000,  /* 24V in microvolts */
-    .temp = 260,          /* 26.0°C in tenths */
+    .time_left = VALUE_UNKNOWN,
+    .voltage = VALUE_UNKNOWN,
+    .temp = VALUE_UNKNOWN,
 };
 
 static int ac_status = 1;
+
+/*
+ * fake_battery_status and ac_status are written from the control device and
+ * read from the property handlers, which the power_supply core may call
+ * concurrently on another CPU and, for some callers, from atomic context.
+ * That rules out a mutex for the data itself, so a spinlock guards it.
+ * Readers hold it just long enough to snapshot the whole struct, which also
+ * keeps the fields mutually consistent - "1% and on mains" is exactly the
+ * torn combination that matters here.
+ *
+ * control_write_lock is a separate mutex that serialises writers only.  The
+ * write path snapshots the state, parses into the snapshot and commits it, so
+ * without it two concurrent writers could lose one another's updates.
+ * Writers are always in process context, so a mutex is the right primitive
+ * there and it is never held across a copy_from_user().
+ */
+static DEFINE_SPINLOCK(fake_battery_lock);
+static DEFINE_MUTEX(control_write_lock);
 
 static char *fake_ac_supplies[] = {
     "BAT0",
@@ -65,9 +120,6 @@ static enum power_supply_property fake_battery_properties[] = {
     POWER_SUPPLY_PROP_HEALTH,
     POWER_SUPPLY_PROP_PRESENT,
     POWER_SUPPLY_PROP_TECHNOLOGY,
-    POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
-    POWER_SUPPLY_PROP_CHARGE_FULL,
-    POWER_SUPPLY_PROP_CHARGE_NOW,
     POWER_SUPPLY_PROP_CAPACITY,
     POWER_SUPPLY_PROP_CAPACITY_LEVEL,
     POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
@@ -114,7 +166,7 @@ static struct power_supply *supplies[sizeof(descriptions) / sizeof(descriptions[
 static ssize_t
 control_device_read(struct file *file, char *buffer, size_t count, loff_t *ppos)
 {
-    static char *message = "fake_battery_nut: capacity, time, voltage, temp, status, charging\n";
+    static char *message = "fake_battery_nut: capacity, time, voltage, temp, status, charging, level\n";
     size_t message_len = strlen(message);
 
     if(count < message_len) {
@@ -134,23 +186,84 @@ control_device_read(struct file *file, char *buffer, size_t count, loff_t *ppos)
     return message_len;
 }
 
-#define prefixed(s, prefix)\
-    (!strncmp((s), (prefix), sizeof(prefix)-1))
-
 static int
-handle_control_line(const char *line, int *ac_status, struct battery_status *battery)
+capacity_to_level(int capacity)
 {
+    if(capacity >= 98) {
+        return POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+    } else if(capacity >= 70) {
+        return POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
+    } else if(capacity >= 30) {
+        return POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+    } else if(capacity >= 5) {
+        return POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+    }
+
+    return POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+}
+
+/* Maps the level= command value onto the power_supply level, 0 = no override */
+static int
+level_to_capacity_level(long level)
+{
+    switch(level) {
+        case 1:
+            return POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+        case 2:
+            return POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+        case 3:
+            return POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+        case 4:
+            return POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
+        case 5:
+            return POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+        default:
+            return 0;
+    }
+}
+
+/*
+ * Parses one "key=value" line into the caller's copy of the state.  The line
+ * is modified in place (it is split at the '='), and nothing global is
+ * touched, so a failure here leaves the published state untouched.
+ */
+static int
+handle_control_line(char *line, int *ac_status, struct battery_status *battery)
+{
+    char *key;
+    char *key_end;
     char *value_p;
+    char *value_end;
     long value;
     int ret;
 
-    value_p = strchrnul(line, '=');
+    value_p = strchr(line, '=');
 
     if(!value_p) {
         return -EINVAL;
     }
 
-    value_p = skip_spaces(value_p + 1);
+    /* Split at the '=' so the key can be compared exactly, not by prefix */
+    *value_p = '\0';
+    key_end  = value_p;
+    key      = skip_spaces(line);
+
+    while(key_end > key && isspace(key_end[-1])) {
+        *--key_end = '\0';
+    }
+
+    value_p   = skip_spaces(value_p + 1);
+    value_end = value_p + strlen(value_p);
+
+    /*
+     * Trim trailing whitespace (and any \r) from the value too.  kstrtol
+     * tolerates a single trailing newline but nothing else, and a write is
+     * now all-or-nothing, so one stray space from a shell pipeline would
+     * otherwise reject the whole batch.
+     */
+    while(value_end > value_p && isspace(value_end[-1])) {
+        *--value_end = '\0';
+    }
 
     ret = kstrtol(value_p, 10, &value);
 
@@ -158,27 +271,19 @@ handle_control_line(const char *line, int *ac_status, struct battery_status *bat
         return ret;
     }
 
-    if(prefixed(line, "capacity")) {
-        battery->capacity = value;
-        /* Auto-update capacity_level based on capacity */
-        if(value >= 98) {
-            battery->capacity_level = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
-        } else if(value >= 70) {
-            battery->capacity_level = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
-        } else if(value >= 30) {
-            battery->capacity_level = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
-        } else if(value >= 5) {
-            battery->capacity_level = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
-        } else {
-            battery->capacity_level = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+    if(!strcmp(key, "capacity")) {
+        if(value < 0 || value > 100) {
+            return -ERANGE;
         }
-    } else if(prefixed(line, "time")) {
-        battery->time_left = value;
-    } else if(prefixed(line, "voltage")) {
-        battery->voltage = value;
-    } else if(prefixed(line, "temp")) {
-        battery->temp = value;
-    } else if(prefixed(line, "status")) {
+        battery->capacity = value;
+        /* Keep the derived level current even while an override is active */
+        battery->capacity_level = capacity_to_level(value);
+    } else if(!strcmp(key, "level")) {
+        if(value < 0 || value > 5) {
+            return -ERANGE;
+        }
+        battery->capacity_level_override = level_to_capacity_level(value);
+    } else if(!strcmp(key, "status")) {
         switch(value) {
             case 0:
                 battery->status = POWER_SUPPLY_STATUS_DISCHARGING;
@@ -187,12 +292,31 @@ handle_control_line(const char *line, int *ac_status, struct battery_status *bat
                 battery->status = POWER_SUPPLY_STATUS_CHARGING;
                 break;
             case 2:
-            default:
                 battery->status = POWER_SUPPLY_STATUS_FULL;
                 break;
+            default:
+                return -ERANGE;
         }
-    } else if(prefixed(line, "charging")) {
+    } else if(!strcmp(key, "charging")) {
+        if(value < 0 || value > 1) {
+            return -ERANGE;
+        }
         *ac_status = value;
+    } else if(!strcmp(key, "time")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        battery->time_left = value;
+    } else if(!strcmp(key, "voltage")) {
+        if(value < VALUE_UNKNOWN || value > INT_MAX) {
+            return -ERANGE;
+        }
+        battery->voltage = value;
+    } else if(!strcmp(key, "temp")) {
+        if(value < TEMP_MIN || value > TEMP_MAX) {
+            return -ERANGE;
+        }
+        battery->temp = value;
     } else {
         return -EINVAL;
     }
@@ -203,11 +327,28 @@ handle_control_line(const char *line, int *ac_status, struct battery_status *bat
 static ssize_t
 control_device_write(struct file *file, const char *buffer, size_t count, loff_t *ppos)
 {
-    char kbuffer[1024];
+    /*
+     * Why a batch of separate write()s to one open fd all land:
+     * ksys_write() copies f_pos into a local, passes that local to this
+     * handler and copies it back afterwards.  This handler never advances
+     * *ppos, so every write - including each echo of a
+     * `{ echo a=1; echo b=2; } > /dev/fake_battery_nut` batch - arrives at
+     * offset 0 and passes the check below.
+     *
+     * The hazard to watch for is a future change that starts advancing
+     * *ppos: the second and later writes of a batch would then be rejected.
+     * (This has nothing to do with .llseek - adding one would not break the
+     * daemon, which never seeks.)
+     */
+    struct battery_status new_status;
+    char kbuffer[1025];
     char *buffer_cursor;
     char *newline;
     size_t bytes_left = count;
-
+    unsigned long flags;
+    bool battery_changed;
+    bool ac_changed;
+    int new_ac_status;
     int status;
 
     if(*ppos != 0) {
@@ -215,8 +356,13 @@ control_device_write(struct file *file, const char *buffer, size_t count, loff_t
         return -EINVAL;
     }
 
-    if(count > 1024) {
-        printk(KERN_ERR "Too much data provided to /dev/fake_battery_nut (limit 1024 bytes)\n");
+    if(count == 0) {
+        return 0;
+    }
+
+    if(count >= sizeof(kbuffer)) {
+        printk(KERN_ERR "Too much data provided to /dev/fake_battery_nut (limit %zu bytes)\n",
+                sizeof(kbuffer) - 1);
         return -EINVAL;
     }
 
@@ -224,16 +370,27 @@ control_device_write(struct file *file, const char *buffer, size_t count, loff_t
 
     if(status != 0) {
         printk(KERN_ERR "bad copy_from_user\n");
-        return -EINVAL;
+        return -EFAULT;
     }
+
+    /* Always terminated inside the data actually supplied */
+    kbuffer[count] = '\0';
+
+    mutex_lock(&control_write_lock);
+
+    spin_lock_irqsave(&fake_battery_lock, flags);
+    new_status    = fake_battery_status;
+    new_ac_status = ac_status;
+    spin_unlock_irqrestore(&fake_battery_lock, flags);
 
     buffer_cursor = kbuffer;
 
     while((newline = memchr(buffer_cursor, '\n', bytes_left))) {
         *newline = '\0';
-        status = handle_control_line(buffer_cursor, &ac_status, &fake_battery_status);
+        status = handle_control_line(buffer_cursor, &new_ac_status, &new_status);
 
         if(status) {
+            mutex_unlock(&control_write_lock);
             return status;
         }
 
@@ -241,13 +398,34 @@ control_device_write(struct file *file, const char *buffer, size_t count, loff_t
         buffer_cursor  = newline + 1;
     }
 
-    power_supply_changed(supplies[0]);
-    power_supply_changed(supplies[1]);
+    if(bytes_left != 0) {
+        printk(KERN_ERR "writes to /dev/fake_battery_nut must end with a newline\n");
+        mutex_unlock(&control_write_lock);
+        return -EINVAL;
+    }
+
+    /* Everything validated - commit the batch as a unit */
+    spin_lock_irqsave(&fake_battery_lock, flags);
+    battery_changed = memcmp(&new_status, &fake_battery_status, sizeof(new_status)) != 0;
+    ac_changed      = new_ac_status != ac_status;
+    fake_battery_status = new_status;
+    ac_status           = new_ac_status;
+    spin_unlock_irqrestore(&fake_battery_lock, flags);
+
+    mutex_unlock(&control_write_lock);
+
+    if(battery_changed) {
+        power_supply_changed(supplies[0]);
+    }
+
+    if(ac_changed) {
+        power_supply_changed(supplies[1]);
+    }
 
     return count;
 }
 
-static struct file_operations control_device_ops = {
+static const struct file_operations control_device_ops = {
     .owner = THIS_MODULE,
     .read = control_device_read,
     .write = control_device_write,
@@ -264,6 +442,13 @@ fake_battery_get_property(struct power_supply *psy,
         enum power_supply_property psp,
         union power_supply_propval *val)
 {
+    struct battery_status status;
+    unsigned long flags;
+
+    spin_lock_irqsave(&fake_battery_lock, flags);
+    status = fake_battery_status;
+    spin_unlock_irqrestore(&fake_battery_lock, flags);
+
     switch (psp) {
         case POWER_SUPPLY_PROP_MANUFACTURER:
             val->strval = "NUT";
@@ -275,7 +460,7 @@ fake_battery_get_property(struct power_supply *psy,
             val->strval = "NUT-UPS";
             break;
         case POWER_SUPPLY_PROP_STATUS:
-            val->intval = fake_battery_status.status;
+            val->intval = status.status;
             break;
         case POWER_SUPPLY_PROP_CHARGE_TYPE:
             val->intval = POWER_SUPPLY_CHARGE_TYPE_FAST;
@@ -290,25 +475,30 @@ fake_battery_get_property(struct power_supply *psy,
             val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
             break;
         case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
-            val->intval = fake_battery_status.capacity_level;
+            val->intval = status.capacity_level_override ?
+                    status.capacity_level_override : status.capacity_level;
             break;
         case POWER_SUPPLY_PROP_CAPACITY:
-        case POWER_SUPPLY_PROP_CHARGE_NOW:
-            val->intval = fake_battery_status.capacity;
-            break;
-        case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
-        case POWER_SUPPLY_PROP_CHARGE_FULL:
-            val->intval = 100;
+            val->intval = status.capacity;
             break;
         case POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:
         case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
-            val->intval = fake_battery_status.time_left;
+            if(status.time_left < 0) {
+                return -ENODATA;
+            }
+            val->intval = status.time_left;
             break;
         case POWER_SUPPLY_PROP_TEMP:
-            val->intval = fake_battery_status.temp;
+            if(status.temp == VALUE_UNKNOWN) {
+                return -ENODATA;
+            }
+            val->intval = status.temp;
             break;
         case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-            val->intval = fake_battery_status.voltage;
+            if(status.voltage < 0) {
+                return -ENODATA;
+            }
+            val->intval = status.voltage;
             break;
         default:
             pr_info("%s: some properties deliberately report errors.\n",
@@ -323,9 +513,13 @@ fake_ac_get_property(struct power_supply *psy,
         enum power_supply_property psp,
         union power_supply_propval *val)
 {
+    unsigned long flags;
+
     switch (psp) {
     case POWER_SUPPLY_PROP_ONLINE:
+            spin_lock_irqsave(&fake_battery_lock, flags);
             val->intval = ac_status;
+            spin_unlock_irqrestore(&fake_battery_lock, flags);
             break;
     default:
             return -EINVAL;
@@ -341,14 +535,16 @@ fake_battery_nut_init(void)
 
     result = misc_register(&control_device);
     if(result) {
-        printk(KERN_ERR "Unable to register misc device!");
+        printk(KERN_ERR "Unable to register misc device!\n");
         return result;
     }
 
     for(i = 0; i < ARRAY_SIZE(descriptions); i++) {
         supplies[i] = power_supply_register(NULL, &descriptions[i], &configs[i]);
         if(IS_ERR(supplies[i])) {
-            printk(KERN_ERR "Unable to register power supply %d in fake_battery_nut\n", i);
+            result = PTR_ERR(supplies[i]);
+            printk(KERN_ERR "Unable to register power supply %d in fake_battery_nut: %d\n",
+                    i, result);
             goto error;
         }
     }
@@ -361,7 +557,7 @@ error:
         power_supply_unregister(supplies[i]);
     }
     misc_deregister(&control_device);
-    return -1;
+    return result;
 }
 
 static void __exit
@@ -384,3 +580,4 @@ module_exit(fake_battery_nut_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("NUT UPS to Linux power_supply bridge");
 MODULE_AUTHOR("Based on linux-fake-battery-module by Rob Hoelz");
+MODULE_VERSION("1.2.0");
